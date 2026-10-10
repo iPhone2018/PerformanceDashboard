@@ -32,18 +32,22 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 from flask import Flask, jsonify, make_response, render_template, request
 
+from data_paths import ENV_VAR, data_root, describe
+
+# 输出强制 UTF-8。Windows 英文系统的控制台和重定向都是 cp1252，打印中文会直接
+# UnicodeEncodeError 崩掉 —— 启动阶段就崩，页面根本起不来。放在任何 print 之前。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 数据目录：部署位置固定，和采集端 timer_get_data.py 里那份 DEFAULT_DATA_ROOT 是同一个值 ——
-# 两边必须指到同一处，否则会出现「采集成功、看板空白」这种谁都不报错的问题。
-# 打包成 exe 后 __file__ 指向临时解包目录 _MEIxxxxxx，本来也不能拿来推路径。
-# 要换位置就设环境变量 DASHBOARD_DATA_DIR（采集端认的是同一个变量）。
-DEFAULT_DATA_ROOT = r"C:\Users\Administrator\Desktop\data"
-if os.name == "nt":
-    DATA_DIR = os.environ.get("DASHBOARD_DATA_DIR") or DEFAULT_DATA_ROOT
-else:
-    # 非 Windows（本地开发自测）落到项目下的 data/
-    DATA_DIR = os.environ.get("DASHBOARD_DATA_DIR") or os.path.join(BASE_DIR, "data")
+# 数据目录从 data_paths 取 —— 那份定义和采集端 timer_get_data.py 共用，
+# 两边不可能指岔。"采集写到一个地方、看板读另一个地方"是最难查的一类问题：
+# 两边都不报错，日志里采集还全是"已保存"，页面却是空的。
+DATA_DIR = data_root()
 HOURLY_DIR = os.path.join(DATA_DIR, "hourly")
 DAILY_DIR = os.path.join(DATA_DIR, "daily")
 
@@ -689,7 +693,25 @@ def download_window():
     return _excel_response(sheets, f"Pareto_{range_key.upper()}_{type_name}_{suffix}.xlsx")
 
 
+def report_data_dir():
+    """启动时把数据目录和里面的文件数打出来。
+
+    "看板空白"最常见的原因就是读错目录 —— 而这在页面上看不出来。
+    把这一行打在控制台，一眼就能对上采集端写的到底是不是同一处。
+    """
+    hourly = glob.glob(os.path.join(HOURLY_DIR, "*.xls*"))
+    daily = glob.glob(os.path.join(DAILY_DIR, "*.xls*"))
+    print(f"[数据目录] {describe()}")
+    print(f"[数据目录] 时报 {len(hourly)} 个 · 日报 {len(daily)} 个")
+    if not hourly and not daily:
+        print("[数据目录] ⚠ 这里一个报表文件都没有，页面会是空的。")
+        print("[数据目录]   如果采集端写到了别处，用环境变量 "
+              f"{ENV_VAR} 把两边指到同一个目录。")
+
+
 if __name__ == "__main__":
+    report_data_dir()
+
     # 采集线程要在 app.run() 之前起：daemon 线程不阻塞主线程，服务立刻可用，
     # 首轮采集在后台跑（冷启动约 30 秒，网络不通时会更久）。
     # 如果以后改用 waitress / gunicorn 启动（不走 __main__），把这一行挪到你的启动脚本里。
