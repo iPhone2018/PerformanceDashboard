@@ -693,20 +693,51 @@ def download_window():
     return _excel_response(sheets, f"Pareto_{range_key.upper()}_{type_name}_{suffix}.xlsx")
 
 
-def report_data_dir():
-    """启动时把数据目录和里面的文件数打出来。
+_DATA_DIR_REPORTED = False
 
-    "看板空白"最常见的原因就是读错目录 —— 而这在页面上看不出来。
-    把这一行打在控制台，一眼就能对上采集端写的到底是不是同一处。
+
+def report_data_dir() -> str:
+    """把"看板正在读哪个目录、里面有多少文件"打出来。
+
+    "看板空白"最常见的原因就是读错目录，而这在页面上完全看不出来：采集端日志里
+    全是"已保存"，页面却是空的。打这一行就能当场对上是不是同一处。
+
+    启动时（__main__）和第一个请求进来时都会尝试调用，但只打一次。
     """
-    hourly = glob.glob(os.path.join(HOURLY_DIR, "*.xls*"))
-    daily = glob.glob(os.path.join(DAILY_DIR, "*.xls*"))
-    print(f"[数据目录] {describe()}")
-    print(f"[数据目录] 时报 {len(hourly)} 个 · 日报 {len(daily)} 个")
+    global _DATA_DIR_REPORTED
+    _DATA_DIR_REPORTED = True
+
+    hourly = sorted(glob.glob(os.path.join(HOURLY_DIR, "*.xls*")))
+    daily = sorted(glob.glob(os.path.join(DAILY_DIR, "*.xls*")))
+    lines = [
+        "=" * 64,
+        f"  看板数据目录 : {describe()}",
+        f"  时报目录     : {HOURLY_DIR}   （{len(hourly)} 个文件）",
+        f"  日报目录     : {DAILY_DIR}   （{len(daily)} 个文件）",
+    ]
+    if hourly:
+        lines.append(f"  时报最新     : {os.path.basename(hourly[-1])}")
+    if daily:
+        lines.append(f"  日报最新     : {os.path.basename(daily[-1])}")
     if not hourly and not daily:
-        print("[数据目录] ⚠ 这里一个报表文件都没有，页面会是空的。")
-        print("[数据目录]   如果采集端写到了别处，用环境变量 "
-              f"{ENV_VAR} 把两边指到同一个目录。")
+        lines += [
+            "  ⚠ 这两个目录里一个报表文件都没有，页面会是空的。",
+            f"    如果采集端写到了别处，把这个环境变量指过去：{ENV_VAR}=<采集端的目录>",
+        ]
+    lines.append("=" * 64)
+    text = "\n".join(lines)
+    print(text, flush=True)
+    return text
+
+
+@app.before_request
+def _report_data_dir_on_first_request():
+    """用 waitress / gunicorn 之类的服务器启动时不会走 __main__，启动横幅打不出来。
+
+    这里兜底补打一次。已经打过的（__main__ 那条路径）就跳过，不会每刷新一下刷一屏。
+    """
+    if not _DATA_DIR_REPORTED:
+        report_data_dir()
 
 
 if __name__ == "__main__":
@@ -714,7 +745,6 @@ if __name__ == "__main__":
 
     # 采集线程要在 app.run() 之前起：daemon 线程不阻塞主线程，服务立刻可用，
     # 首轮采集在后台跑（冷启动约 30 秒，网络不通时会更久）。
-    # 如果以后改用 waitress / gunicorn 启动（不走 __main__），把这一行挪到你的启动脚本里。
     if COLLECTOR_ENABLED and collector is not None:
         collector.start_background()
 
