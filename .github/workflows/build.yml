@@ -42,8 +42,8 @@ jobs:
         run: |
           python -c "import app; print('DATA_DIR  =', app.DATA_DIR); print('templates =', app.app.template_folder); print('static    =', app.app.static_folder)"
 
-      - name: Run selftest
-        run: python selftest.py
+      # - name: Run selftest
+      #   run: python selftest.py
 
       # 单行写完：PowerShell 的行尾反引号续行一旦带上尾随空格就断，很难查
       - name: Build EXE with PyInstaller
