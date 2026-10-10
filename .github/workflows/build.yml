@@ -14,6 +14,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # windows-latest 是英文系统，Python 默认按 cp1252 编码输出，打印中文会
+      # UnicodeEncodeError。开了 UTF-8 模式，所有 python 步骤都不再受代码页影响。
+      PYTHONUTF8: "1"
 
     steps:
       - name: Checkout code
@@ -56,4 +60,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/Performance Dashboard.exe
-
