@@ -63,17 +63,19 @@ DOMAIN_PASS = os.environ.get("DNA_PASS") or "#F.h071."
 # 采集产物落到「看板项目的 data/」下这两个子目录里，和看板读的是同一处：
 #     data/daily/   Alarm_YYYYMMDD.xls        Operation_YYYYMMDD.xls
 #     data/hourly/  Alarm_YYYYMMDD_HH00.xls   Operation_YYYYMMDD_HH00.xls
-# 默认取脚本自身所在目录（也就是和 app.py 并排的那个目录），并认 app.py 用的
-# 同一个环境变量 DASHBOARD_DATA_DIR —— 两边用同一套约定，永远不会指岔。
-#
-# 打包成 exe（PyInstaller）后不能再用 __file__：它指向的是临时解包目录
-# _MEIxxxxxx，exe 一退出就被删掉，data/ 和日志会跟着一起消失（表现为
-# 每轮都看不到上一轮的文件、等于全量重采）。冻结状态下改用 exe 自己所在的目录。
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+# 部署位置固定，所以路径直接写死 —— 不让它跟着 exe 走。
+# 这样即使 exe 被挪动、或者从别的机器拷过来直接跑，数据也只会落在这一处，
+# 不会出现「采集写到一个地方、看板读另一个地方」这种最难查的问题。
+# （打包成 exe 后 __file__ 指向的是临时解包目录 _MEIxxxxxx，本来也不能用。）
+# 要换位置就设环境变量 DASHBOARD_DATA_DIR —— app.py 认的是同一个变量。
+DEFAULT_DATA_ROOT = r"C:\Users\Administrator\Desktop\data"
+
+if os.name == "nt":
+    DATA_ROOT = os.environ.get("DASHBOARD_DATA_DIR") or DEFAULT_DATA_ROOT
 else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_ROOT = os.environ.get("DASHBOARD_DATA_DIR") or os.path.join(BASE_DIR, "data")
+    # 非 Windows（本地开发自测）落到脚本旁边的 data/
+    DATA_ROOT = os.environ.get("DASHBOARD_DATA_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data")
 DIR_DAILY = os.path.join(DATA_ROOT, "daily")
 DIR_HOURLY = os.path.join(DATA_ROOT, "hourly")
 LOG_DIR = os.path.join(DATA_ROOT, "logs")
@@ -172,6 +174,10 @@ log = logging.getLogger("dna")
 
 # ------------------------- 基础设施 -------------------------
 def setup_logging():
+    try:                       # Windows 控制台/重定向的代码页不是中文时，中文会写成 ????
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     os.makedirs(LOG_DIR, exist_ok=True)
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -267,21 +273,70 @@ def field_time(dt: datetime.datetime) -> str:
     return f"{dt.month}/{dt.day}/{dt.year} {hour12}:{dt.minute:02d}:{dt.second:02d} {ampm}"
 
 
-def read_report_range(data: bytes):
-    """从 .xls 报表头读回真实时间段：r2c2 = Start，r3c2 = End。"""
+def _cell_text(sheet, r, c) -> str:
+    """取单元格文本。日期型单元格必须换算 —— 直接 str() 会得到一串 Excel 序列号数字。"""
     import xlrd
-    sheet = xlrd.open_workbook(file_contents=data, logfile=NULL_LOG).sheet_by_index(0)
-
-    def cell(row, col):
-        if row < sheet.nrows and col < sheet.ncols:
-            return str(sheet.cell_value(row, col))
+    if r >= sheet.nrows or c >= sheet.ncols:
         return ""
+    if sheet.cell_type(r, c) == xlrd.XL_CELL_DATE:
+        dt = xlrd.xldate.xldate_as_datetime(sheet.cell_value(r, c), sheet.book.datemode)
+        return dt.strftime("%Y/%m/%d %H:%M:%S")
+    return str(sheet.cell_value(r, c))
 
-    def parse(text):
-        m = RE_DATE.search(text)
-        return datetime.datetime(*[int(x) for x in m.groups()]) if m else None
 
-    return parse(cell(2, 2)), parse(cell(3, 2))
+def sheet_head_text(sheet, rows=12, cols=8) -> str:
+    """把表头前几行拼成文本 —— 校验失败时打进日志，不用拿到文件也能看出真实版式。"""
+    lines = [f"    工作表 [{sheet.name}] {sheet.nrows} 行 x {sheet.ncols} 列"]
+    for r in range(min(sheet.nrows, rows)):
+        cells = [_cell_text(sheet, r, c).strip()[:22] for c in range(min(sheet.ncols, cols))]
+        lines.append(f"    r{r}: " + " | ".join(cells))
+    return "\n".join(lines)
+
+
+def _scan_sheet(sheet):
+    """在一张工作表里找 Start / End 时间。
+
+    不猜固定格子 —— 手工导出的样张和程序导出的版式未必一致（吃过这个亏）。
+    扫前 15 行找 'Start:' / 'End:' 标签，取它右边最多 3 格里第一个像日期的值；
+    万一标签也没有，就退化成「表头里按顺序出现的第 1、2 个日期」。
+    """
+    found: dict[str, datetime.datetime] = {}
+    seen = []
+    for r in range(min(sheet.nrows, 15)):
+        for c in range(min(sheet.ncols, 8)):
+            text = _cell_text(sheet, r, c)
+            matched = RE_DATE.search(text)
+            if matched and len(seen) < 2:
+                seen.append(matched)
+            for key in ("start", "end"):
+                if key in found or not text.strip().lower().startswith(key + ":"):
+                    continue
+                for c2 in range(c, min(sheet.ncols, c + 4)):
+                    m2 = RE_DATE.search(_cell_text(sheet, r, c2))
+                    if m2:
+                        found[key] = datetime.datetime(*[int(x) for x in m2.groups()])
+                        break
+    if len(seen) >= 2:
+        for key, m in zip(("start", "end"), seen):
+            found.setdefault(key, datetime.datetime(*[int(x) for x in m.groups()]))
+    return found.get("start"), found.get("end")
+
+
+def read_report_range(data: bytes):
+    """从 .xls 报表头读回真实时间段，并附带各工作表表头文本供排错。
+
+    不猜固定格子、也不假设只有一张表 —— 逐个工作表扫，谁先扫出 Start 就用谁。
+    """
+    import xlrd
+    book = xlrd.open_workbook(file_contents=data, logfile=NULL_LOG)
+    texts = []
+    for idx in range(book.nsheets):
+        sheet = book.sheet_by_index(idx)
+        start, end = _scan_sheet(sheet)
+        texts.append(sheet_head_text(sheet))
+        if start is not None:
+            return start, end, "\n".join(texts)
+    return None, None, "\n".join(texts)
 
 
 # ------------------------- 核心：一次采集 -------------------------
@@ -329,12 +384,13 @@ def fetch_report(sess, report_key: str, start_dt: datetime.datetime,
         head = data[:300].decode("utf-8", "replace")
         raise RuntimeError(f"导出不是 .xls（头 {data[:8].hex()}），响应片段: {head}")
 
-    got_start, got_end = read_report_range(data)
+    got_start, got_end, head = read_report_range(data)
     if got_start is None:
-        raise RuntimeError("读不出报表头里的 Start，格式可能变了")
+        # 把表头打进报错里：万一版式又变了，日志本身就能说明问题，不用再猜
+        raise RuntimeError("读不出报表头里的 Start。报表头实际内容：\n" + head)
     if abs((got_start - start_dt).total_seconds()) > 60:
-        raise RuntimeError(f"时间段不符：请求 {start_dt} ~ {end_dt}，"
-                           f"文件里是 {got_start} ~ {got_end}")
+        raise RuntimeError(f"时间段不符：请求 {start_dt} ~ {end_dt}，文件里是 "
+                           f"{got_start} ~ {got_end}\n报表头实际内容：\n" + head)
 
     save_atomic(dest_path, data)
     log.info("已保存 %s（%s ~ %s，%d 字节）",
