@@ -20,7 +20,14 @@ DNA Pareto 报表自动采集
     * ExcelPreview.aspx 返回的是老式 .xls（OLE2），不是 .xlsx。
 
 运行环境（Windows 那台机器）：
-    pip install requests requests-ntlm schedule xlrd
+    pip install requests requests-ntlm xlrd
+
+两种跑法：
+    python timer_get_data.py           常驻，每 RUN_EVERY_MINUTES 分钟一轮
+    python timer_get_data.py --once    只跑一轮就退出（配合任务计划程序）
+
+也可以让看板 app.py 起个线程来跑（见 app.py 里的 start_background 调用），
+单实例锁保证这两种方式不会同时采集。
 """
 
 import os
@@ -30,6 +37,7 @@ import time
 import glob
 import logging
 import datetime
+import threading
 from html.parser import HTMLParser
 from urllib.parse import quote
 from logging.handlers import TimedRotatingFileHandler
@@ -90,6 +98,20 @@ RUN_EVERY_MINUTES = 30       # 调度间隔
 #   "refresh" = 每轮都重采（看板能看到当天/当小时的实时进展，代价是每轮 4 个请求）
 #   "skip"    = 干脆不采（看板那一格显示为「缺失」，数据永远只到昨天/上一个整点）
 CURRENT_BUCKET_MODE = "once"
+
+# 采集状态 —— 每轮采集的进度和结果。日志汇总用它；采集线程不往外抛异常，
+# 出错时这些字段就是事后排查的线索。看板不读它。
+STATUS = {
+    "enabled": False,       # 这个进程里有没有真的起采集线程
+    "running": False,       # 当前是否正在跑一轮
+    "rounds": 0,            # 已经跑完的轮数
+    "last_start": None,     # 上一轮开始时间
+    "last_finish": None,    # 上一轮结束时间
+    "last_ok": None,        # 上一次「跑完且没有失败项」的时间
+    "last_saved": 0,        # 上一轮保存了几个文件
+    "last_failed": 0,       # 上一轮失败了几个
+    "last_error": "",       # 最近一次的错误摘要
+}
 
 REPORT_MAP = {
     "alarm_day": "Users/administrator/Alarm-day",
@@ -587,11 +609,12 @@ def needs_fetch(dest_path: str, bucket_end: datetime.datetime, is_current: bool)
 
 
 def collect_daily(sess):
-    """最近 DAILY_CHECK_DAYS 个已走完的日子，外加今天。"""
+    """最近 DAILY_CHECK_DAYS 个已走完的日子，外加今天。返回 (成功数, 失败数)。"""
     today = datetime.date.today()
     days = [today - datetime.timedelta(days=d) for d in range(1, DAILY_CHECK_DAYS + 1)]
     if CURRENT_BUCKET_MODE != "skip":
         days.insert(0, today)
+    saved = failed = 0
     for day in days:
         start_dt = datetime.datetime.combine(day, datetime.time(0, 0, 0))
         end_dt = start_dt + datetime.timedelta(days=1)
@@ -600,15 +623,20 @@ def collect_daily(sess):
             dest = os.path.join(DIR_DAILY, f"{prefix}_{day:%Y%m%d}.xls")
             if not needs_fetch(dest, end_dt, is_current):
                 continue
-            try_fetch(sess, report_key, start_dt, end_dt, dest)
+            if try_fetch(sess, report_key, start_dt, end_dt, dest):
+                saved += 1
+            else:
+                failed += 1
+    return saved, failed
 
 
 def collect_hourly(sess):
-    """最近 HOURLY_CHECK_HOURS 个已走完的整点，外加当前这个小时。"""
+    """最近 HOURLY_CHECK_HOURS 个已走完的整点，外加当前这个小时。返回 (成功数, 失败数)。"""
     current = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
     hours = [current - datetime.timedelta(hours=h) for h in range(1, HOURLY_CHECK_HOURS + 1)]
     if CURRENT_BUCKET_MODE != "skip":
         hours.insert(0, current)
+    saved = failed = 0
     for start_dt in hours:
         end_dt = start_dt + datetime.timedelta(hours=1)
         is_current = start_dt == current
@@ -616,29 +644,103 @@ def collect_hourly(sess):
             dest = os.path.join(DIR_HOURLY, f"{prefix}_{start_dt:%Y%m%d_%H}00.xls")
             if not needs_fetch(dest, end_dt, is_current):
                 continue
-            try_fetch(sess, report_key, start_dt, end_dt, dest)
+            if try_fetch(sess, report_key, start_dt, end_dt, dest):
+                saved += 1
+            else:
+                failed += 1
+    return saved, failed
 
 
 def main_task():
-    started = datetime.datetime.now()
-    log.info("========== 任务开始 %s ==========", started)
-    try:
-        clean_old_files(DIR_DAILY)
-        clean_old_files(DIR_HOURLY)
-    except Exception:
-        log.exception("清理过期文件异常")
+    """跑一轮完整采集。
 
-    sess = make_session()
+    **绝不向外抛异常** —— 它可能跑在看板进程的线程里，异常一冒出去线程就死了，
+    而页面照常打开、看起来毫无异样。所有分支都就地兜住，并把状态写进 STATUS。
+    """
+    started = datetime.datetime.now()
+    STATUS["running"] = True
+    STATUS["last_start"] = started
+    STATUS["last_error"] = ""
+    log.info("========== 任务开始 %s ==========", started)
+
+    saved = failed = 0
     try:
-        for name, job in (("日报", collect_daily), ("时报", collect_hourly)):
-            try:
-                job(sess)
-            except Exception:
-                log.exception("%s采集异常", name)
+        try:
+            clean_old_files(DIR_DAILY)
+            clean_old_files(DIR_HOURLY)
+            clean_old_files(QUARANTINE_DIR)
+        except Exception as exc:
+            log.exception("清理过期文件异常")
+            STATUS["last_error"] = f"清理异常: {exc}"
+
+        sess = make_session()
+        try:
+            for name, job in (("日报", collect_daily), ("时报", collect_hourly)):
+                try:
+                    got_saved, got_failed = job(sess)
+                    saved += got_saved
+                    failed += got_failed
+                except Exception as exc:
+                    log.exception("%s采集异常", name)
+                    STATUS["last_error"] = f"{name}异常: {exc}"
+        finally:
+            sess.close()
+    except Exception as exc:                       # make_session 等兜底
+        log.exception("采集轮次异常")
+        STATUS["last_error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        sess.close()
-    log.info("========== 任务结束，耗时 %.0f 秒 ==========",
-             (datetime.datetime.now() - started).total_seconds())
+        finished = datetime.datetime.now()
+        STATUS["running"] = False
+        STATUS["last_finish"] = finished
+        STATUS["last_saved"] = saved
+        STATUS["last_failed"] = failed
+        STATUS["rounds"] += 1
+        if failed == 0 and not STATUS["last_error"]:
+            STATUS["last_ok"] = finished
+        log.info("========== 任务结束，保存 %d 个、失败 %d 个，耗时 %.0f 秒 ==========",
+                 saved, failed, (finished - started).total_seconds())
+
+
+def seconds_until_next_round() -> float:
+    """对齐到整点/半点再跑 —— 整点刚过就立刻去补上一个小时，不会拖到一个小时后。"""
+    period = RUN_EVERY_MINUTES * 60
+    return max(5.0, period - (time.time() % period))
+
+
+def _run_forever():
+    while True:
+        try:
+            main_task()
+        except Exception:                  # main_task 已经不抛了，这是双保险
+            log.exception("采集线程捕到异常，继续下一轮")
+        time.sleep(seconds_until_next_round())
+
+
+def start_background():
+    """在看板进程里起一个守护线程跑采集。
+
+    单实例锁保证「看板里起了线程」和「旁边另跑一个 timer_get_data.py」不会同时采。
+    起不来就返回 None，看板照常服务。
+    """
+    setup_logging()
+    os.makedirs(DIR_DAILY, exist_ok=True)
+    os.makedirs(DIR_HOURLY, exist_ok=True)
+
+    lock = acquire_single_instance()
+    if lock is None:
+        log.error("已有采集实例在运行，看板内不再重复启动")
+        STATUS["enabled"] = False
+        STATUS["last_error"] = "已有采集实例在运行"
+        return None
+
+    log.info("本机时间 %s（时区 %s），请确认与 DNA 服务器一致",
+             datetime.datetime.now(), time.tzname)
+    check_same_stem_duplicates()
+    STATUS["enabled"] = True
+    thread = threading.Thread(target=_run_forever, name="dna-collector", daemon=True)
+    thread.start()
+    log.info("看板内已启动采集线程，每 %d 分钟一轮", RUN_EVERY_MINUTES)
+    return thread
 
 
 def main():
@@ -654,21 +756,14 @@ def main():
     log.info("本机时间 %s（时区 %s），请确认与 DNA 服务器一致",
              datetime.datetime.now(), time.tzname)
     check_same_stem_duplicates()
+    STATUS["enabled"] = True
 
     if "--once" in sys.argv:            # 配合任务计划程序：跑一轮就退出
         main_task()
         return
 
-    import schedule
-    schedule.every(RUN_EVERY_MINUTES).minutes.do(main_task)
     log.info("已启动，每 %d 分钟执行一次，Ctrl+C 停止", RUN_EVERY_MINUTES)
-    main_task()
-    while True:
-        try:
-            schedule.run_pending()
-        except Exception:
-            log.exception("调度异常")
-        time.sleep(10)
+    _run_forever()
 
 
 if __name__ == "__main__":
