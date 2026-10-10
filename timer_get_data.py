@@ -39,6 +39,8 @@ import logging
 import datetime
 import threading
 from html.parser import HTMLParser
+
+from data_paths import data_root, subdirs
 from urllib.parse import quote
 from logging.handlers import TimedRotatingFileHandler
 
@@ -71,22 +73,12 @@ DOMAIN_PASS = os.environ.get("DNA_PASS") or "#F.h071."
 # 采集产物落到「看板项目的 data/」下这两个子目录里，和看板读的是同一处：
 #     data/daily/   Alarm_YYYYMMDD.xls        Operation_YYYYMMDD.xls
 #     data/hourly/  Alarm_YYYYMMDD_HH00.xls   Operation_YYYYMMDD_HH00.xls
-# 部署位置固定，所以路径直接写死 —— 不让它跟着 exe 走。
-# 这样即使 exe 被挪动、或者从别的机器拷过来直接跑，数据也只会落在这一处，
-# 不会出现「采集写到一个地方、看板读另一个地方」这种最难查的问题。
-# （打包成 exe 后 __file__ 指向的是临时解包目录 _MEIxxxxxx，本来也不能用。）
-# 要换位置就设环境变量 DASHBOARD_DATA_DIR —— app.py 认的是同一个变量。
-DEFAULT_DATA_ROOT = r"C:\Users\Administrator\Desktop\data"
-
-if os.name == "nt":
-    DATA_ROOT = os.environ.get("DASHBOARD_DATA_DIR") or DEFAULT_DATA_ROOT
-else:
-    # 非 Windows（本地开发自测）落到脚本旁边的 data/
-    DATA_ROOT = os.environ.get("DASHBOARD_DATA_DIR") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data")
-DIR_DAILY = os.path.join(DATA_ROOT, "daily")
-DIR_HOURLY = os.path.join(DATA_ROOT, "hourly")
-LOG_DIR = os.path.join(DATA_ROOT, "logs")
+# 目录从 data_paths 取 —— 那份定义和看板 app.py 共用，两边不可能指岔。
+# 它内部：Windows 用固定路径 C:\Users\Administrator\Desktop\data（不跟 exe 走，
+# 因为打包后 __file__ 指向临时解包目录 _MEIxxxxxx，本来也不能用）；
+# 要换位置就设环境变量 DASHBOARD_DATA_DIR，两个进程都要设成同一个。
+DIR_DAILY, DIR_HOURLY, LOG_DIR = subdirs()
+DATA_ROOT = data_root()
 
 DAILY_CHECK_DAYS = 7         # 日报回溯天数
 HOURLY_CHECK_HOURS = 24      # 时报回溯小时数
