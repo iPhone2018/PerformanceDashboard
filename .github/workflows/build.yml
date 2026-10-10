@@ -1,1 +1,59 @@
+name: Build Performance Dashboard
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 打 tag 时要发 Release，不显式给会 403
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # 看板要 requirements.txt（flask/pandas/openpyxl），
+      # 内嵌的采集线程还要 requirements-timer.txt（requests/requests-ntlm/xlrd）
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+          pip install -r requirements-timer.txt
+
+      # 提前暴露 import 错误和路径推导结果，别等打完包才发现
+      - name: Smoke test
+        run: |
+          python -c "import app; print('DATA_DIR  =', app.DATA_DIR); print('templates =', app.app.template_folder); print('static    =', app.app.static_folder)"
+
+      - name: Run selftest
+        run: python selftest.py
+
+      # 单行写完：PowerShell 的行尾反引号续行一旦带上尾随空格就断，很难查
+      - name: Build EXE with PyInstaller
+        run: pyinstaller --onefile --console --noconfirm --name "Performance Dashboard" --add-data "templates;templates" --add-data "static;static" --exclude-module fcntl app.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-dashboard
+          path: dist/Performance Dashboard.exe
+
+      - name: Create Release (if tag pushed)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Performance Dashboard.exe
 
