@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Valmet 操作与报警事件看板</title>
+<script src="/static/echarts.min.js"></script>
+<script>
+  // 本地 echarts 缺失时回落到 CDN（内网离线环境下走本地文件）
+  window.echarts || document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"><\/script>');
+</script>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --axis:           #c3c2b7;
+    --border:         rgba(11, 11, 11, 0.10);
+    --hover:          rgba(11, 11, 11, 0.04);
+    --series-1:       #2a78d6;   /* 操作 */
+    --series-2:       #eb6834;   /* 报警 */
+    --accent-soft:    rgba(42, 120, 214, 0.10);
+    --status-critical: #d03b3b;  /* 数据缺失报警色，深浅色一致不随主题变 */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --axis:           #383835;
+      --border:         rgba(255, 255, 255, 0.10);
+      --hover:          rgba(255, 255, 255, 0.06);
+      --series-1:       #3987e5;
+      --series-2:       #d95926;
+      --accent-soft:    rgba(57, 135, 229, 0.16);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --axis:           #383835;
+    --border:         rgba(255, 255, 255, 0.10);
+    --hover:          rgba(255, 255, 255, 0.06);
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --accent-soft:    rgba(57, 135, 229, 0.16);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1560px; margin: 0 auto; padding: 20px 16px 40px; }
+
+  /* ---------- 顶栏 ---------- */
+  .topbar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 18px; margin-bottom: 16px;
+    background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 12px;
+  }
+  /* logo 本身是白底深色字，统一加白色圆角底板：浅色下看不出，深色下不会露出硬边白块 */
+  .topbar img {
+    height: 30px; width: auto; display: block;
+    box-sizing: content-box; padding: 4px 7px;
+    background: #fff; border-radius: 8px;
+  }
+  .topbar .titles { flex: 1 1 auto; min-width: 0; }
+  .topbar h1 { margin: 0; font-size: 19px; font-weight: 600; letter-spacing: .2px; }
+  .topbar .sub { margin-top: 2px; font-size: 12.5px; color: var(--text-secondary); }
+  .topbar .sub b { font-weight: 600; color: var(--text-primary); }
+  .actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+
+  button, .btn {
+    font: inherit; font-size: 13px; line-height: 1;
+    color: var(--text-primary); background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 13px; cursor: pointer; text-decoration: none;
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  button:hover, .btn:hover { background: var(--hover); }
+  .btn-primary { background: var(--series-1); border-color: transparent; color: #fff; font-weight: 500; }
+  .btn-primary:hover { background: var(--series-1); filter: brightness(1.07); }
+
+  /* ---------- 面板 ---------- */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .panel {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px 12px; min-width: 0;
+  }
+  .panel-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 4px; }
+  .panel-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .panel-head .note { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .chart { width: 100%; height: 340px; }
+  .chart.bars { height: 302px; }
+  .foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 8px 0 6px; }
+  .hint { font-size: 12px; color: var(--text-muted); }
+  .hint b { font-weight: 500; color: var(--text-secondary); }
+  /* 数据缺失提示：图标 + 文字，不靠颜色单独表意 */
+  .datanote { font-size: 12px; color: var(--status-critical); margin-top: 3px; }
+
+  /* ---------- 提示条 ---------- */
+  .banner {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 3px solid var(--series-2);
+    border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;
+    font-size: 13px; color: var(--text-secondary);
+  }
+  .loading { opacity: .55; transition: opacity .2s ease; }
+  .hidden { display: none !important; }
+
+  /* ---------- 下载提示 ---------- */
+  #toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 12px);
+    background: var(--text-primary); color: var(--surface-1);
+    padding: 10px 18px; border-radius: 999px; font-size: 13px;
+    opacity: 0; pointer-events: none; transition: opacity .2s ease, transform .2s ease;
+    z-index: 60; max-width: 88vw; text-align: center;
+  }
+  #toast.show { opacity: .96; transform: translate(-50%, 0); }
+
+  /* ---------- 柱子点击弹窗 ---------- */
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, .42);
+    display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
+  }
+  .modal {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 14px; padding: 20px 22px; width: min(440px, 100%);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .28);
+  }
+  .modal .m-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .modal .m-head h4 { margin: 0; font-size: 13px; font-weight: 500; color: var(--text-secondary); flex: 1 1 auto; }
+  .modal .m-close { border: none; background: transparent; padding: 2px 6px; font-size: 18px; line-height: 1; color: var(--text-muted); }
+  .modal .m-tag { font-size: 22px; font-weight: 600; word-break: break-all; }
+  .modal .m-desc { color: var(--text-secondary); margin-top: 2px; word-break: break-word; }
+  .modal .m-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0 4px; }
+  .modal .m-grid div span { display: block; font-size: 12px; color: var(--text-muted); }
+  .modal .m-grid div b { font-size: 17px; font-weight: 600; }
+  .modal .m-tip { font-size: 12px; color: var(--text-muted); margin-top: 14px; border-top: 1px solid var(--grid); padding-top: 10px; }
+
+  /* ---------- ECharts tooltip ---------- */
+  .tt-head { font-weight: 600; margin-bottom: 4px; }
+  .tt-row { display: flex; align-items: center; gap: 6px; }
+  .tt-row b { margin-left: auto; font-variant-numeric: tabular-nums; padding-left: 12px; }
+  .tt-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .tt-tip { margin-top: 6px; padding-top: 6px; border-top: 1px solid rgba(128, 128, 128, .3); font-size: 11.5px; opacity: .75; }
+
+  @media (max-width: 1080px) {
+    .grid-2 { grid-template-columns: 1fr; }
+    .topbar { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <img src="/static/valmet_logo.png" alt="Valmet">
+    <div class="titles">
+      <h1>操作与报警事件看板</h1>
+      <div class="sub" id="meta-line">数据加载中…</div>
+    </div>
+    <div class="actions">
+      <button id="btn-refresh" type="button">↻ 刷新</button>
+      <button id="btn-theme" type="button" title="切换深/浅色">◐ 主题</button>
+    </div>
+  </div>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <!-- 趋势：点击圆点直接下载该小时 / 该天的原始 Excel -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>近 24 小时趋势</h3>
+          <div class="note" id="note-hour">—</div>
+          <div class="datanote hidden" id="quality-hour"></div>
+        </div>
+      </div>
+      <div class="chart" id="chart-hour"></div>
+      <div class="foot"><span class="hint">点击图上的 <b>圆点</b> 可直接下载该小时的原始 Excel</span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>近 7 天趋势</h3>
+          <div class="note" id="note-day">—</div>
+          <div class="datanote hidden" id="quality-day"></div>
+        </div>
+      </div>
+      <div class="chart" id="chart-day"></div>
+      <div class="foot"><span class="hint">点击图上的 <b>圆点</b> 可直接下载该天的原始 Excel</span></div>
+    </div>
+  </div>
+
+  <!-- TOP10：操作 / 报警 分开统计，2×2 -->
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3 id="top-title-0">—</h3>
+          <div class="note" id="top-note-0"></div>
+          <div class="datanote hidden" id="top-quality-0"></div>
+        </div>
+      </div>
+      <div class="chart bars" id="chart-top-0"></div>
+      <div class="foot"><a class="btn btn-primary" id="top-dl-0" href="#">⬇ 下载</a></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3 id="top-title-1">—</h3>
+          <div class="note" id="top-note-1"></div>
+          <div class="datanote hidden" id="top-quality-1"></div>
+        </div>
+      </div>
+      <div class="chart bars" id="chart-top-1"></div>
+      <div class="foot"><a class="btn btn-primary" id="top-dl-1" href="#">⬇ 下载</a></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3 id="top-title-2">—</h3>
+          <div class="note" id="top-note-2"></div>
+          <div class="datanote hidden" id="top-quality-2"></div>
+        </div>
+      </div>
+      <div class="chart bars" id="chart-top-2"></div>
+      <div class="foot"><a class="btn btn-primary" id="top-dl-2" href="#">⬇ 下载</a></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3 id="top-title-3">—</h3>
+          <div class="note" id="top-note-3"></div>
+          <div class="datanote hidden" id="top-quality-3"></div>
+        </div>
+      </div>
+      <div class="chart bars" id="chart-top-3"></div>
+      <div class="foot"><a class="btn btn-primary" id="top-dl-3" href="#">⬇ 下载</a></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<div class="modal-mask hidden" id="modal-mask">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="m-head">
+      <h4 id="modal-source">—</h4>
+      <button type="button" class="m-close" id="modal-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="m-tag" id="modal-tag">—</div>
+    <div class="m-desc" id="modal-desc"></div>
+    <div class="m-grid">
+      <div><span>类型</span><b id="modal-type">—</b></div>
+      <div><span>次数</span><b id="modal-count">—</b></div>
+      <div><span>占比</span><b id="modal-pct">—</b></div>
+    </div>
+    <div class="m-tip">点击下方按钮可下载该时段该类事件的全部原始明细（含该 Tag 的所有记录）。</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var FONT = 'system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
+  var TOKENS = ['--surface-1', '--text-primary', '--text-secondary', '--text-muted',
+                '--grid', '--axis', '--border', '--series-1', '--series-2'];
+
+  var state = { data: null, charts: {} };
+  var toastTimer = null;
+
+  // ---------- 工具 ----------
+  function $(id) { return document.getElementById(id); }
+
+  function fmt(n) {
+    return (n === null || n === undefined || isNaN(n)) ? '—' : Number(n).toLocaleString('en-US');
+  }
+
+  // 占比统一保留 1 位小数，避免出现 6% / 6.0% 混排
+  function pct(n) {
+    return (n === null || n === undefined || isNaN(n)) ? '—' : Number(n).toFixed(1);
+  }
+
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function tokens() {
+    var cs = getComputedStyle(document.documentElement);
+    var t = {};
+    TOKENS.forEach(function (name) {
+      t[name.replace(/^--/, '').replace(/-/g, '_')] = cs.getPropertyValue(name).trim();
+    });
+    return t;
+  }
+
+  function ensureChart(key, domId) {
+    if (!state.charts[key]) {
+      var el = $(domId);
+      if (!el || !window.echarts) { return null; }
+      state.charts[key] = window.echarts.init(el, null, { renderer: 'canvas' });
+    }
+    return state.charts[key];
+  }
+
+  function setQuality(id, text) {
+    var node = $(id);
+    if (!node) { return; }
+    if (text) {
+      node.textContent = '⚠ ' + text;
+      node.classList.remove('hidden');
+    } else {
+      node.textContent = '';
+      node.classList.add('hidden');
+    }
+  }
+
+  function toast(message) {
+    var el = $('toast');
+    if (!el) { return; }
+    el.textContent = message;
+    el.classList.add('show');
+    if (toastTimer) { clearTimeout(toastTimer); }
+    toastTimer = setTimeout(function () { el.classList.remove('show'); }, 2600);
+  }
+
+  // 用隐藏 a 标签触发下载，避免 window.open 被拦截
+  function triggerDownload(url, message) {
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    window.setTimeout(function () {
+      if (a.parentNode) { a.parentNode.removeChild(a); }
+    }, 0);
+    toast(message);
+  }
+
+  window.addEventListener('resize', function () {
+    Object.keys(state.charts).forEach(function (k) {
+      try { state.charts[k].resize(); } catch (e) { /* noop */ }
+    });
+  });
+
+  // ---------- 折线图：操作 / 报警（点圆点下载对应时段）----------
+  function axisInterval(count) {
+    if (count <= 12) { return 0; }
+    return function (index) { return index % 3 === 0 || index === count - 1; };
+  }
+
+  // 把连续缺失的整点归并成区间，用于画缺口灰带
+  function missingRanges(labels, missing) {
+    var set = {};
+    (missing || []).forEach(function (l) { set[l] = true; });
+    var ranges = [], start = null;
+    labels.forEach(function (l, i) {
+      if (set[l]) {
+        if (start === null) { start = i; }
+      } else if (start !== null) {
+        ranges.push([start, i - 1]);
+        start = null;
+      }
+    });
+    if (start !== null) { ranges.push([start, labels.length - 1]); }
+    return ranges;
+  }
+
+  function lineOption(T, labels, opData, alarmData, hintText, missing) {
+    var values = opData.concat(alarmData).filter(function (v) { return v !== null && v !== undefined; });
+    var hasData = labels.length > 0 && values.length > 0;
+    var yMax = values.length ? Math.max.apply(null, values) : 1;
+    var ranges = hasData ? missingRanges(labels, missing) : [];
+    return {
+      // 整段窗口都没有数据时给一句占位，而不是画一张空图
+      title: hasData ? undefined : {
+        show: true, text: labels.length ? '该时段所有整点的数据都缺失' : '暂无数据',
+        left: 'center', top: 'middle',
+        textStyle: { color: T.text_muted, fontSize: 13, fontWeight: 'normal', fontFamily: FONT }
+      },
+      color: [T.series_1, T.series_2],
+      textStyle: { fontFamily: FONT },
+      animationDuration: 420,
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'line', lineStyle: { color: T.axis, width: 1 } },
+        backgroundColor: T.surface_1,
+        borderColor: T.border, borderWidth: 1, padding: [9, 12],
+        textStyle: { color: T.text_primary, fontSize: 12.5, fontFamily: FONT },
+        extraCssText: 'border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.14);',
+        formatter: function (params) {
+          var rows = params.map(function (p) {
+            return '<div class="tt-row"><span class="tt-dot" style="background:' + p.color + '"></span>'
+              + esc(p.seriesName) + '<b>'
+              + (p.value === null || p.value === undefined ? '无数据' : fmt(p.value)) + '</b></div>';
+          }).join('');
+          return '<div class="tt-head">' + esc(params[0].axisValue) + '</div>' + rows
+            + '<div class="tt-tip">' + esc(hintText) + '</div>';
+        }
+      },
+      legend: {
+        top: 0, right: 0, icon: 'circle', itemWidth: 8, itemHeight: 8, itemGap: 16,
+        textStyle: { color: T.text_secondary, fontSize: 12.5, fontFamily: FONT }
+      },
+      grid: { left: 34, right: 42, top: 40, bottom: 4, containLabel: true },
+      xAxis: {
+        type: 'category', data: labels, boundaryGap: false,
+        axisLine: { lineStyle: { color: T.axis, width: 1 } },
+        axisTick: { show: false },
+        axisLabel: {
+          color: T.text_muted, fontSize: 10.5, fontFamily: FONT,
+          rotate: labels.length > 12 ? 42 : 0,
+          interval: axisInterval(labels.length), hideOverlap: true, margin: 10
+        }
+      },
+      yAxis: {
+        type: 'value', minInterval: 1, splitNumber: 4,
+        axisLine: { show: false }, axisTick: { show: false },
+        axisLabel: { color: T.text_muted, fontSize: 10.5, fontFamily: FONT,
+                     formatter: function (v) { return fmt(v); } },
+        splitLine: { lineStyle: { color: T.grid, width: 1, type: 'solid' } }
+      },
+      series: [
+        { name: '操作事件', data: opData, color: T.series_1 },
+        { name: '报警事件', data: alarmData, color: T.series_2 }
+      ].map(function (s, si) {
+        return {
+          name: s.name, type: 'line', data: s.data, cursor: 'pointer',
+          symbol: 'circle', symbolSize: 8, showSymbol: true,
+          // 缺数据的时段必须断开，不能连过去假装是连续的
+          connectNulls: false,
+          markArea: (si === 0 && ranges.length) ? {
+            silent: true,
+            itemStyle: { color: T.grid, opacity: 0.7 },
+            data: ranges.map(function (r) {
+              return [{ coord: [r[0] - 0.5, 0] }, { coord: [r[1] + 0.5, yMax * 1.08] }];
+            })
+          } : undefined,
+          lineStyle: { width: 2, color: s.color, cap: 'round', join: 'round' },
+          itemStyle: { color: s.color, borderColor: T.surface_1, borderWidth: 2 },
+          emphasis: { scale: 1.35 },
+          z: 3
+        };
+      })
+    };
+  }
+
+  // ---------- 横向条形图：TOP10（Tag 名在左，次数+占比标在柱端）----------
+  function barOption(T, chart) {
+    // ECharts 类目轴自下而上，先倒过来让次数最多的排在最上面
+    var items = chart.items.slice().reverse();
+    var color = chart.type === 'Alarm' ? T.series_2 : T.series_1;
+    var data = items.map(function (i) {
+      return { value: i.count, tag: i.tag, pct: i.pct, desc: i.description, typeLabel: i.type_label };
+    });
+    return {
+      textStyle: { fontFamily: FONT },
+      animationDuration: 420,
+      title: items.length ? undefined : {
+        show: true, text: '暂无数据', left: 'center', top: 'middle',
+        textStyle: { color: T.text_muted, fontSize: 13, fontWeight: 'normal', fontFamily: FONT }
+      },
+      tooltip: {
+        trigger: 'item',
+        backgroundColor: T.surface_1,
+        borderColor: T.border, borderWidth: 1, padding: [9, 12],
+        textStyle: { color: T.text_primary, fontSize: 12.5, fontFamily: FONT },
+        extraCssText: 'border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.14); max-width:320px;',
+        formatter: function (p) {
+          var d = p.data;
+          return '<div class="tt-head">' + esc(d.tag) + '</div>'
+            + (d.desc ? '<div style="color:' + T.text_secondary + ';margin-bottom:6px">' + esc(d.desc) + '</div>' : '')
+            + '<div class="tt-row"><span class="tt-dot" style="background:' + color + '"></span>次数<b>' + fmt(d.value) + '</b></div>'
+            + '<div class="tt-row"><span class="tt-dot" style="background:' + T.axis + '"></span>占比<b>' + pct(d.pct) + '%</b></div>'
+            + '<div class="tt-tip">点击柱子查看该 Tag 详情</div>';
+        }
+      },
+      // 右侧留出柱端标签的位置，containLabel 只管坐标轴、不管 series 标签
+      grid: { left: 6, right: 96, top: 8, bottom: 6, containLabel: true },
+      xAxis: {
+        type: 'value', minInterval: 1, splitNumber: 3,
+        axisLine: { show: false }, axisTick: { show: false },
+        axisLabel: { color: T.text_muted, fontSize: 10.5, fontFamily: FONT,
+                     formatter: function (v) { return fmt(v); } },
+        splitLine: { lineStyle: { color: T.grid, width: 1, type: 'solid' } }
+      },
+      yAxis: {
+        type: 'category', data: items.map(function (i) { return i.tag; }),
+        axisLine: { show: false }, axisTick: { show: false },
+        axisLabel: { color: T.text_secondary, fontSize: 11, fontFamily: FONT, margin: 10 }
+      },
+      series: [{
+        type: 'bar', barMaxWidth: 12, cursor: 'pointer', data: data,
+        itemStyle: { color: color, borderRadius: [0, 4, 4, 0] },
+        label: {
+          show: true, position: 'right', distance: 6,
+          color: T.text_secondary, fontSize: 11, fontFamily: FONT,
+          formatter: function (p) { return fmt(p.value) + '次 (' + pct(p.data.pct) + '%)'; }
+        },
+        labelLayout: { hideOverlap: true },
+        emphasis: { itemStyle: { color: color, opacity: .85 } }
+      }]
+    };
+  }
+
+  // ---------- 弹窗 ----------
+  function showModal(sourceLabel, item) {
+    $('modal-source').textContent = sourceLabel;
+    $('modal-tag').textContent = item.tag;
+    $('modal-desc').textContent = item.desc || '';
+    $('modal-type').textContent = item.typeLabel || '—';
+    $('modal-count').textContent = fmt(item.value) + ' 次';
+    $('modal-pct').textContent = pct(item.pct) + '%';
+    $('modal-mask').classList.remove('hidden');
+    $('modal-close').focus();
+  }
+
+  function hideModal() { $('modal-mask').classList.add('hidden'); }
+
+  $('modal-close').addEventListener('click', hideModal);
+  $('modal-mask').addEventListener('click', function (e) {
+    if (e.target === $('modal-mask')) { hideModal(); }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { hideModal(); }
+  });
+
+  // ---------- 渲染 ----------
+  function render() {
+    var res = state.data;
+    if (!res || !res.ok) {
+      $('banner').classList.remove('hidden');
+      $('banner').textContent = (res && res.message) || '数据加载失败，请检查 data/hourly 与 data/daily 目录。';
+      return;
+    }
+    $('banner').classList.add('hidden');
+
+    var T = tokens();
+    var meta = res.meta;
+
+    $('meta-line').innerHTML = '数据截止 <b>' + esc(meta.data_through) + '</b>'
+      + ' ｜ 小时文件 ' + meta.files.hourly + ' 个 · 天文件 ' + meta.files.daily + ' 个'
+      + ' ｜ 页面生成 ' + esc(meta.generated_at);
+
+    $('note-hour').textContent = meta.hour_window.label + ' · ' + meta.hour_window.points + ' 个整点'
+      + ' · 数据覆盖 ' + meta.hour_window.covered + '/' + meta.hour_window.points;
+    $('note-day').textContent = meta.day_window.label + ' · ' + meta.day_window.days + ' 天'
+      + ' · 数据覆盖 ' + meta.day_window.covered + '/' + meta.day_window.days;
+    setQuality('quality-hour', meta.hour_window.quality);
+    setQuality('quality-day', meta.day_window.quality);
+
+    // 折线图：点击圆点下载该小时 / 该天
+    var hourChart = ensureChart('hour', 'chart-hour');
+    if (hourChart) {
+      hourChart.setOption(
+        lineOption(T, res.hour.labels, res.hour.op, res.hour.alarm,
+                   '点击圆点可下载该小时的原始 Excel', meta.hour_window.missing), true);
+      hourChart.off('click');
+      hourChart.on('click', function (p) {
+        var key = res.hour.keys[p.dataIndex];
+        if (!key) { return; }
+        triggerDownload('/api/download/hour?key=' + key,
+          '正在下载 ' + res.hour.labels[p.dataIndex] + ' 的原始 Excel');
+      });
+    }
+
+    var dayChart = ensureChart('day', 'chart-day');
+    if (dayChart) {
+      dayChart.setOption(
+        lineOption(T, res.day.labels, res.day.op, res.day.alarm,
+                   '点击圆点可下载该天的原始 Excel', meta.day_window.missing), true);
+      dayChart.off('click');
+      dayChart.on('click', function (p) {
+        var key = res.day.keys[p.dataIndex];
+        if (!key) { return; }
+        triggerDownload('/api/download/day?key=' + key,
+          '正在下载 ' + res.day.labels[p.dataIndex] + ' 的原始 Excel');
+      });
+    }
+
+    // 四张 TOP10（近24小时·操作 / 近24小时·报警 / 近7天·操作 / 近7天·报警）
+    (res.charts || []).forEach(function (c, i) {
+      $('top-title-' + i).textContent = c.title;
+      $('top-note-' + i).textContent = c.note;
+      setQuality('top-quality-' + i, c.data_note);
+      var link = $('top-dl-' + i);
+      link.setAttribute('href', c.download_url);
+      link.textContent = '⬇ ' + c.download_label;
+
+      var chart = ensureChart('top' + i, 'chart-top-' + i);
+      if (!chart) { return; }
+      chart.setOption(barOption(T, c), true);
+      chart.off('click');
+      chart.on('click', function (p) {
+        if (p.data) { showModal(c.title, p.data); }
+      });
+    });
+
+    var problems = [];
+    if (meta.hour_window.quality) { problems.push('近 24 小时：' + meta.hour_window.quality); }
+    if (meta.day_window.quality) { problems.push('近 7 天：' + meta.day_window.quality); }
+    if (meta.warnings && meta.warnings.length) {
+      problems.push('有 ' + meta.warnings.length + ' 个文件被跳过：' + meta.warnings.join('；'));
+    }
+    if (problems.length) {
+      $('banner').classList.remove('hidden');
+      $('banner').textContent = '⚠ 数据不完整 —— ' + problems.join('；');
+    }
+  }
+
+  // ---------- 数据加载 ----------
+  function load() {
+    var wrap = document.querySelector('.wrap');
+    wrap.classList.add('loading');
+    return fetch('/api/data', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (json) { state.data = json; render(); })
+      .catch(function (err) {
+        $('banner').classList.remove('hidden');
+        $('banner').textContent = '接口请求失败：' + err;
+      })
+      .then(function () { wrap.classList.remove('loading'); });
+  }
+
+  // ---------- 主题 ----------
+  function applyTheme(theme, rerender) {
+    if (theme === 'dark' || theme === 'light') {
+      document.documentElement.setAttribute('data-theme', theme);
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+    }
+    try { localStorage.setItem('valmet-theme', theme); } catch (e) { /* 隐私模式忽略 */ }
+    if (rerender) { render(); }
+  }
+
+  $('btn-theme').addEventListener('click', function () {
+    var current = document.documentElement.getAttribute('data-theme');
+    if (!current) {
+      current = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    applyTheme(current === 'dark' ? 'light' : 'dark', true);
+  });
+
+  $('btn-refresh').addEventListener('click', load);
+
+  (function initTheme() {
+    var saved = null;
+    try { saved = localStorage.getItem('valmet-theme'); } catch (e) { /* noop */ }
+    if (saved) { applyTheme(saved, false); }
+  })();
+
+  load();
+  setInterval(load, 5 * 60 * 1000);   // 每 5 分钟自动刷新
+
+  // 便于调试 / 自测
+  window.dashboard = { state: state, render: render, load: load, tokens: tokens, triggerDownload: triggerDownload };
+})();
+</script>
+</body>
+</html>
