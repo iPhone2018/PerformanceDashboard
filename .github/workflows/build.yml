@@ -47,7 +47,7 @@ jobs:
 
       # 单行写完：PowerShell 的行尾反引号续行一旦带上尾随空格就断，很难查
       - name: Build EXE with PyInstaller
-        run: pyinstaller --onefile --console --noconfirm --name "Performance Dashboard" --add-data "templates;templates" --add-data "static;static" --exclude-module fcntl app.py
+        run: pyinstaller --onefile --console --noconfirm --name "Performance Dashboard" --icon favicon.ico --add-data "templates;templates" --add-data "static;static" --exclude-module fcntl app.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
