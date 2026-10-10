@@ -31,6 +31,15 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 
+# 输出强制 UTF-8。不设的话，Windows 会按系统代码页编码 —— 中文系统是 cp936、
+# 英文系统是 cp1252，后者连中文都编不出来，print 一句就 UnicodeEncodeError 崩掉
+# （GitHub Actions 的 windows-latest 就是英文系统，CI 上正是这么挂的）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("SELFTEST_PORT", 0)) or None   # 0/未设置 = 自动挑空闲端口
 BASE_URL = ""                                            # 由 main() 决定
