@@ -99,6 +99,14 @@ REPORT_MAP = {
 }
 VIEWSTATEGENERATOR_FALLBACK = "8BBF9466"
 
+# 每个报表里明细的 Type 应该是什么 —— 用来校验「拿回来的确实是这个报表」
+EXPECTED_TYPE = {
+    "alarm_day": "Alarm",
+    "alarm_hour": "Alarm",
+    "oper_day": "Operation",
+    "oper_hour": "Operation",
+}
+
 # 抓包逐字段核对过的表单底稿（Alarm 页面）。时间字段在下面按次覆盖。
 BASE_FORM = {
     "__EVENTTARGET": "refreshButton",
@@ -167,7 +175,27 @@ BASE_FORM = {
 
 XLS_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 RE_SESSION = re.compile(r"\(S\([^)]+\)\)")
-RE_DATE = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})")
+# 报表头的时间有两种写法，都要认：
+#   * 手工导出的样张（报警/9.20.xls）：2026/9/20 8:00:00        年在前、24 小时制
+#   * ExcelPreview.aspx 导出的：      10/10/2026 12:00:00 AM    月在前、12 小时制
+# 后者和页面上报表头显示的格式一致（Start: 10/10/2026 10:41:25 A）。
+RE_DATE_YMD = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})[\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?")
+RE_DATE_MDY = re.compile(
+    r"(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP])\.?\s*M\.?", re.I)
+
+
+def parse_dt(text: str):
+    """把报表头里的一段文本解析成 datetime，两种版式都认。"""
+    m = RE_DATE_YMD.search(text)
+    if m:
+        y, mo, d, h, mi, s = m.groups()
+        return datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s or 0))
+    m = RE_DATE_MDY.search(text)
+    if m:
+        mo, d, y, h, mi, s, ap = m.groups()
+        hour = int(h) % 12 + (12 if ap.upper() == "P" else 0)   # 12 AM -> 0 点，12 PM -> 12 点
+        return datetime.datetime(int(y), int(mo), int(d), hour, int(mi), int(s or 0))
+    return None
 
 log = logging.getLogger("dna")
 
@@ -301,31 +329,57 @@ def _scan_sheet(sheet):
     万一标签也没有，就退化成「表头里按顺序出现的第 1、2 个日期」。
     """
     found: dict[str, datetime.datetime] = {}
-    seen = []
+    seen: list[datetime.datetime] = []
     for r in range(min(sheet.nrows, 15)):
         for c in range(min(sheet.ncols, 8)):
             text = _cell_text(sheet, r, c)
-            matched = RE_DATE.search(text)
-            if matched and len(seen) < 2:
-                seen.append(matched)
+            parsed = parse_dt(text)
+            if parsed is not None and len(seen) < 2:
+                seen.append(parsed)
             for key in ("start", "end"):
                 if key in found or not text.strip().lower().startswith(key + ":"):
                     continue
                 for c2 in range(c, min(sheet.ncols, c + 4)):
-                    m2 = RE_DATE.search(_cell_text(sheet, r, c2))
-                    if m2:
-                        found[key] = datetime.datetime(*[int(x) for x in m2.groups()])
+                    parsed2 = parse_dt(_cell_text(sheet, r, c2))
+                    if parsed2 is not None:
+                        found[key] = parsed2
                         break
     if len(seen) >= 2:
-        for key, m in zip(("start", "end"), seen):
-            found.setdefault(key, datetime.datetime(*[int(x) for x in m.groups()]))
+        found.setdefault("start", seen[0])
+        found.setdefault("end", seen[1])
     return found.get("start"), found.get("end")
 
 
+def first_detail_type(sheet) -> str | None:
+    """明细区第一行的 Type 值 —— 用来发现「报表选错了」。
+
+    曾经出现过请求操作报表、拿回来的却是报警数据（行数、报表头全对，只有内容是错的）。
+    脚本看不出报表选了哪个，但明细里的 Type 骗不了人。
+    """
+    header_row = None
+    for r in range(min(sheet.nrows, 40)):
+        values = [_cell_text(sheet, r, c).strip().lower() for c in range(min(sheet.ncols, 9))]
+        if all(key in values for key in ("type", "tag", "description", "count")):
+            header_row = r
+            break
+    if header_row is None:
+        return None
+    type_col = next((c for c in range(min(sheet.ncols, 9))
+                     if _cell_text(sheet, header_row, c).strip().lower() == "type"), None)
+    if type_col is None:
+        return None
+    for r in range(header_row + 1, min(sheet.nrows, header_row + 4)):
+        value = _cell_text(sheet, r, type_col).strip()
+        if value:
+            return value
+    return None
+
+
 def read_report_range(data: bytes):
-    """从 .xls 报表头读回真实时间段，并附带各工作表表头文本供排错。
+    """从 .xls 报表头读回真实时间段，并附带表头文本和明细类型供排错。
 
     不猜固定格子、也不假设只有一张表 —— 逐个工作表扫，谁先扫出 Start 就用谁。
+    返回 (start, end, 表头文本, 明细第一行的 Type)。
     """
     import xlrd
     book = xlrd.open_workbook(file_contents=data, logfile=NULL_LOG)
@@ -335,8 +389,8 @@ def read_report_range(data: bytes):
         start, end = _scan_sheet(sheet)
         texts.append(sheet_head_text(sheet))
         if start is not None:
-            return start, end, "\n".join(texts)
-    return None, None, "\n".join(texts)
+            return start, end, "\n".join(texts), first_detail_type(sheet)
+    return None, None, "\n".join(texts), None
 
 
 # ------------------------- 核心：一次采集 -------------------------
@@ -354,6 +408,22 @@ def fetch_report(sess, report_key: str, start_dt: datetime.datetime,
     sess_seg = m.group(0)
     viewer_url = f"{BASE_URL}/{sess_seg}/Viewer.aspx?report={report_path}"
     export_url = f"{BASE_URL}/{sess_seg}/ExcelPreview.aspx"
+
+    # 诊断用：页面上到底加载的是哪个报表。曾经出现过「请求操作报表却拿回报警数据」，
+    # 靠这行能看出是 report 参数没生效、还是导出接口给了旧文件。
+    page_title = re.search(r"<title[^>]*>(.*?)</title>", resp.text, re.I | re.S)
+    log.info("页面已加载 %s | 标题: %s", resp.url,
+             page_title.group(1).strip() if page_title else "取不到")
+
+    # 没有会话段时服务器会 302 到带 (S(xxx)) 的地址，而那个 302 有可能把 query
+    # string 丢掉 —— 那样页面加载的就是默认报表，之后 POST/导出全跟着默认报表走
+    # （表现为「时间范围变了、报表类型没变」）。检测到就带会话段重新加载一次。
+    if "report=" not in resp.url:
+        log.info("302 把 report 参数丢了，改用带会话段的地址重新加载")
+        resp = sess.get(viewer_url, timeout=(10, 60))
+        resp.raise_for_status()
+        if "report=" not in resp.url:
+            raise RuntimeError(f"report 参数始终没生效，最终 URL = {resp.url}")
 
     viewstate = hidden_value(resp.text, "__VIEWSTATE")
     if not viewstate:
@@ -384,13 +454,19 @@ def fetch_report(sess, report_key: str, start_dt: datetime.datetime,
         head = data[:300].decode("utf-8", "replace")
         raise RuntimeError(f"导出不是 .xls（头 {data[:8].hex()}），响应片段: {head}")
 
-    got_start, got_end, head = read_report_range(data)
+    got_start, got_end, head, detail_type = read_report_range(data)
     if got_start is None:
         # 把表头打进报错里：万一版式又变了，日志本身就能说明问题，不用再猜
         raise RuntimeError("读不出报表头里的 Start。报表头实际内容：\n" + head)
     if abs((got_start - start_dt).total_seconds()) > 60:
         raise RuntimeError(f"时间段不符：请求 {start_dt} ~ {end_dt}，文件里是 "
                            f"{got_start} ~ {got_end}\n报表头实际内容：\n" + head)
+
+    # 报表选错了就拦下来 —— 宁可报错重试，也不能把报警数据当成操作数据存进去
+    expected = EXPECTED_TYPE[report_key]
+    if detail_type and detail_type.lower() != expected.lower():
+        raise RuntimeError(f"报表选错了：请求 {REPORT_MAP[report_key]}（应为 {expected}），"
+                           f"但导出内容里的 Type 是 {detail_type}\n报表头实际内容：\n" + head)
 
     save_atomic(dest_path, data)
     log.info("已保存 %s（%s ~ %s，%d 字节）",
