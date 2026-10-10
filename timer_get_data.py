@@ -27,10 +27,10 @@ import os
 import re
 import sys
 import time
-import html
 import glob
 import logging
 import datetime
+from html.parser import HTMLParser
 from urllib.parse import quote
 from logging.handlers import TimedRotatingFileHandler
 
@@ -97,8 +97,6 @@ REPORT_MAP = {
     "oper_day": "Users/administrator/Operation-day",
     "oper_hour": "Users/administrator/Operation-hour",
 }
-VIEWSTATEGENERATOR_FALLBACK = "8BBF9466"
-
 # 每个报表里明细的 Type 应该是什么 —— 用来校验「拿回来的确实是这个报表」
 EXPECTED_TYPE = {
     "alarm_day": "Alarm",
@@ -284,14 +282,103 @@ def make_session():
     return sess
 
 
-def hidden_value(page: str, name: str):
-    """取 <input type="hidden" name="..."> 的值，容忍属性顺序变化。"""
-    for tag in re.findall(r"<input[^>]*>", page, re.I):
-        if re.search(r'name="%s"' % re.escape(name), tag, re.I):
-            m = re.search(r'value="([^"]*)"', tag, re.I)
-            if m:
-                return html.unescape(m.group(1))
-    return None
+class _FormParser(HTMLParser):
+    """把页面里的表单控件收成 {name: value}。
+
+    等价于「浏览器点刷新时会提交的内容」。**必须按页面自己的默认值来**，不能照抄
+    另一张报表页面的那份：实测导出的是报警还是操作数据，取决于筛选条件里的
+    「事件类型」勾了哪一项，而两个报表页面的默认勾选是不同的。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.fields: dict[str, str] = {}
+        self._select = None
+        self._select_value = None
+        self._select_picked = False
+        self._textarea = None
+
+    def handle_starttag(self, tag, attrs):
+        attr = {k.lower(): (v if v is not None else "") for k, v in attrs}
+        if "disabled" in attr:
+            return
+        if tag == "input":
+            name = attr.get("name")
+            if not name:
+                return
+            kind = attr.get("type", "text").lower()
+            if kind in ("submit", "button", "image", "reset", "file"):
+                return
+            if kind in ("checkbox", "radio"):
+                if "checked" in attr:
+                    self.fields[name] = attr.get("value") or "on"
+            else:
+                self.fields[name] = attr.get("value", "")
+        elif tag == "select":
+            self._select = attr.get("name")
+            self._select_value, self._select_picked = None, False
+        elif tag == "option" and self._select:
+            if "selected" in attr or not self._select_picked:
+                self._select_value = attr.get("value", "")
+                self._select_picked = True
+        elif tag == "textarea":
+            self._textarea = attr.get("name")
+            if self._textarea:
+                self.fields[self._textarea] = ""
+
+    def handle_data(self, data):
+        if self._textarea:
+            self.fields[self._textarea] += data
+
+    def handle_endtag(self, tag):
+        if tag == "select" and self._select:
+            self.fields[self._select] = self._select_value or ""
+            self._select = None
+        elif tag == "textarea":
+            self._textarea = None
+
+
+def build_form(page: str, start_dt: datetime.datetime, end_dt: datetime.datetime) -> dict:
+    """按页面实际渲染出来的控件构建 POST 表单，只覆盖时间范围。
+
+    拿不到足够控件时退回内置底稿 BASE_FORM —— 但那样筛选条件就是报警页面的那份，
+    操作报表会导出成报警数据（TYPE_MISMATCH 那道校验会拦下来）。
+    """
+    parser = _FormParser()
+    try:
+        parser.feed(page)
+    except Exception:
+        log.warning("解析页面表单失败，退回内置底稿", exc_info=True)
+    parsed = parser.fields
+
+    if len(parsed) >= 20:
+        form = dict(parsed)
+        log.info("按页面实际控件构建表单：%d 个字段", len(form))
+    else:
+        log.warning("页面里只解析到 %d 个表单控件，退回内置底稿", len(parsed))
+        form = dict(BASE_FORM)
+
+    # 状态字段无论如何都要用页面上的（底稿里没有 __VIEWSTATE）
+    for key in ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION", "__LASTFOCUS"):
+        if parsed.get(key):
+            form[key] = parsed[key]
+
+    form["__EVENTTARGET"] = "refreshButton"
+    form["__EVENTARGUMENT"] = ""
+
+    # 时间字段：按后缀找，免得页面控件编号变了（ctl22 / ctl21）就写不进去。
+    # 值用字面空格，别手工转义。
+    for suffix, value in (("$StartTimeHidden", start_dt.strftime("%Y-%m-%d %H:%M:%S")),
+                          ("$EndTimeHidden", end_dt.strftime("%Y-%m-%d %H:%M:%S")),
+                          ("$startTimeField", field_time(start_dt)),
+                          ("$endTimeField", field_time(end_dt))):
+        names = [key for key in form if key.endswith(suffix)]
+        if names:
+            for key in names:
+                form[key] = value
+        else:
+            form["ctl22" + suffix] = value
+    return form
 
 
 def field_time(dt: datetime.datetime) -> str:
@@ -425,19 +512,9 @@ def fetch_report(sess, report_key: str, start_dt: datetime.datetime,
         if "report=" not in resp.url:
             raise RuntimeError(f"report 参数始终没生效，最终 URL = {resp.url}")
 
-    viewstate = hidden_value(resp.text, "__VIEWSTATE")
-    if not viewstate:
+    form = build_form(resp.text, start_dt, end_dt)
+    if not form.get("__VIEWSTATE"):
         raise RuntimeError("页面里没有 __VIEWSTATE，可能被重定向到登录页")
-    viewstategen = hidden_value(resp.text, "__VIEWSTATEGENERATOR") or VIEWSTATEGENERATOR_FALLBACK
-
-    form = dict(BASE_FORM)
-    form["__VIEWSTATE"] = viewstate
-    form["__VIEWSTATEGENERATOR"] = viewstategen
-    # 字面空格，别手工转义
-    form["ctl22$StartTimeHidden"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-    form["ctl22$EndTimeHidden"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-    form["ctl22$startTimeField"] = field_time(start_dt)
-    form["ctl22$endTimeField"] = field_time(end_dt)
 
     # ② POST 刷新：把时间范围写进服务端会话，响应是 HTML，丢弃
     posted = sess.post(viewer_url, data=form, timeout=(10, 120),
