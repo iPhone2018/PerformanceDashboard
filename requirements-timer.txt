@@ -1,0 +1,11 @@
+# timer_get_data.py（采集脚本）在 Windows 那台机器上需要的第三方依赖
+#     pip install -r requirements-timer.txt
+#
+# 其余 import（os / re / sys / time / threading / glob / logging / datetime /
+# html.parser / urllib.parse / msvcrt）全部是 Python 标准库，不用装。
+# 采集脚本不需要 flask / pandas / openpyxl —— 那是看板 app.py 的事。
+# 反过来，看板要内嵌采集线程的话，把这些也装上即可（装不上看板也能照常跑）。
+
+requests>=2.28
+requests-ntlm>=1.2        # import 名是 requests_ntlm；会连带装上 cryptography / pyspnego
+xlrd>=2.0                 # 2.x 只读老式 .xls —— 正是 ExcelPreview.aspx 的格式
