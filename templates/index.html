@@ -638,17 +638,52 @@
   }
 
   // ---------- 数据加载 ----------
+  function showBanner(text) {
+    var banner = $('banner');
+    banner.classList.remove('hidden');
+    banner.textContent = text;
+  }
+
+  // 用 XMLHttpRequest 而不是 fetch：IE11 没有 fetch（要 Edge 14 才有），
+  // 而内网这台机器的浏览器就是 IE11 —— 页面结构照常显示，JS 一跑到 fetch 就
+  // " 'fetch' is undefined " 整个挂掉，数据永远取不回来。
+  // XHR 从 IE9 到现代浏览器通吃，这里不需要 Promise。
   function load() {
     var wrap = document.querySelector('.wrap');
     wrap.classList.add('loading');
-    return fetch('/api/data', { cache: 'no-store' })
-      .then(function (r) { return r.json(); })
-      .then(function (json) { state.data = json; render(); })
-      .catch(function (err) {
-        $('banner').classList.remove('hidden');
-        $('banner').textContent = '接口请求失败：' + err;
-      })
-      .then(function () { wrap.classList.remove('loading'); });
+
+    var xhr = new XMLHttpRequest();
+    // 加时间戳绕开缓存（原来是 fetch 的 cache:'no-store'，IE 上用不了）
+    xhr.open('GET', '/api/data?_=' + new Date().getTime(), true);
+    // IE 对不带 charset 的 application/json 可能按本地代码页解，显式指定 UTF-8，
+    // 否则中文 Tag 描述会变乱码
+    try { xhr.overrideMimeType('text/plain; charset=utf-8'); } catch (e) { /* 忽略 */ }
+
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4) { return; }
+      wrap.classList.remove('loading');
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        showBanner('接口请求失败：HTTP ' + xhr.status);
+        return;
+      }
+      var json;
+      try {
+        json = JSON.parse(xhr.responseText);
+      } catch (err) {
+        showBanner('接口返回的不是合法 JSON：' + err);
+        return;
+      }
+      state.data = json;
+      render();
+    };
+
+    xhr.onerror = function () {
+      wrap.classList.remove('loading');
+      showBanner('接口请求失败：网络错误（服务没起来？）');
+    };
+
+    xhr.send();
   }
 
   // ---------- 主题 ----------
