@@ -65,7 +65,14 @@ DOMAIN_PASS = os.environ.get("DNA_PASS") or "#F.h071."
 #     data/hourly/  Alarm_YYYYMMDD_HH00.xls   Operation_YYYYMMDD_HH00.xls
 # 默认取脚本自身所在目录（也就是和 app.py 并排的那个目录），并认 app.py 用的
 # 同一个环境变量 DASHBOARD_DATA_DIR —— 两边用同一套约定，永远不会指岔。
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+#
+# 打包成 exe（PyInstaller）后不能再用 __file__：它指向的是临时解包目录
+# _MEIxxxxxx，exe 一退出就被删掉，data/ 和日志会跟着一起消失（表现为
+# 每轮都看不到上一轮的文件、等于全量重采）。冻结状态下改用 exe 自己所在的目录。
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.environ.get("DASHBOARD_DATA_DIR") or os.path.join(BASE_DIR, "data")
 DIR_DAILY = os.path.join(DATA_ROOT, "daily")
 DIR_HOURLY = os.path.join(DATA_ROOT, "hourly")
