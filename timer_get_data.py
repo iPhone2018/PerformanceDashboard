@@ -660,7 +660,6 @@ def main_task():
         try:
             clean_old_files(DIR_DAILY)
             clean_old_files(DIR_HOURLY)
-            clean_old_files(QUARANTINE_DIR)
         except Exception as exc:
             log.exception("清理过期文件异常")
             STATUS["last_error"] = f"清理异常: {exc}"
