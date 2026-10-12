@@ -15,10 +15,12 @@
     GET /api/download/window 某时段某一类事件的全部原始明细（range=24h|7d, type=Operation|Alarm）
 
 统计口径：
-    * 近 24 小时 -> 取 hourly 目录，以最新一个小时文件为基准往前 24 个整点；
-    * 近 7 天    -> 取 daily 目录，以最新一天文件为基准往前 7 天；
+    * 近 24 小时 -> 取 hourly 目录，从最后一个走完的整点往前 24 个整点；
+    * 近 7 天    -> 取 daily 目录，从昨天往前 7 天；
     * 操作 / 报警两类事件全程分开统计，占比的分母是同时段同类事件总数。
-    基准取“数据里最新的时间”，而不是机器当前时间，这样历史导出数据也能正常看。
+    两个窗口都按机器当前时间定基准，都到"最后一个走完的时段"为止（正在走的这一小时 /
+    当天只走了一部分，统计进去最后一个点必然偏低），不按数据里最新的文件 —— 采集断掉
+    的那几个时段会老老实实缺在图上，而不是被“挪出”窗口之后看起来一切正常。
 """
 from __future__ import annotations
 
@@ -408,26 +410,66 @@ def _collect(directory_buckets: dict, slots: list, key_fmt: str, label_fmt: str,
     }
 
 
-def collect_windows(hourly: dict, daily: dict) -> dict:
+def window_anchors(now: datetime | None = None) -> tuple[datetime, date]:
+    """两个窗口的末端基准 —— 取机器当前时间。
+
+    * 近 24 小时：末端 = 最后一个**走完**的整点（17:13 打开页面 → 末点 16:00）。
+      正在走的这一小时只统计了十几分钟，画上去最后一个点必然偏低，不纳入。
+    * 近 7 天：末端 = 昨天，同理（当天的日报只走了一半，最后一天会腰斩）。
+
+    两头都是"最后一个走完的时段"，口径一致。基准以前取的是数据里最新的文件，
+    代价是采集断掉的时段会被悄悄挪出窗口 —— 图上看着一切正常，少了数据反而看不出来。
+    """
+    now = now or datetime.now()
+    return (now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1),
+            now.date() - timedelta(days=1))
+
+
+def _hour_window_note(hour: dict) -> str:
+    """24 小时窗口末点的说明 —— 末点是最后一个走完的整点，不是当前正在走的那个。"""
+    return f"末点 {hour['labels'][-1]}（最后一个走完的整点）"
+
+
+def collect_windows(hourly: dict, daily: dict, now: datetime | None = None) -> dict:
     """把「近 24 小时」「近 7 天」两个窗口整理好，趋势图与 TOP10 共用同一份口径。
 
-    基准取数据里最新的整点 / 最新的一天。缺文件的时段折线断开（不是 0），
+    窗口按当前时间定，不按数据里最新的一格。缺文件的时段折线断开（不是 0），
     文件存在但没记录的时段按真实的 0 处理，两者都会在页面上单独标出。
     """
-    hour_anchor = max(hourly) if hourly else None
-    day_anchor = max(daily) if daily else (hour_anchor.date() if hour_anchor else date.today())
+    now = now or datetime.now()          # 只取一次，两个窗口和"旧了多少"用它同一份
+    hour_anchor, day_anchor = window_anchors(now)
 
-    hour_slots = [hour_anchor - timedelta(hours=i) for i in range(23, -1, -1)] if hour_anchor else []
+    hour_slots = [hour_anchor - timedelta(hours=i) for i in range(23, -1, -1)]
     hour = _collect(hourly, hour_slots, "%Y%m%d%H", "%m-%d %H:00", "%Y-%m-%d %H:00")
     day = _collect(daily, [day_anchor - timedelta(days=i) for i in range(6, -1, -1)],
                    DAY_FMT, DAY_FMT, DAY_FMT)
+    # 末点说明挂在窗口上：趋势图副标题和两张 24 小时排行图的口径都要带它
+    hour["note"] = _hour_window_note(hour) if hour["labels"] else ""
 
-    hour_range = "-"
-    if hour_anchor is not None:
-        # 整个 24 小时窗口：从最早那个整点到最后一个整点的结束时刻
-        hour_range = (f"{(hour_anchor - timedelta(hours=23)).strftime('%m-%d %H:%M')} ~ "
-                      f"{(hour_anchor + timedelta(hours=1)).strftime('%m-%d %H:%M')}")
+    # 整个 24 小时窗口：从最早那个整点到最后一个整点的结束时刻
+    hour_range = (f"{(hour_anchor - timedelta(hours=23)).strftime('%m-%d %H:%M')} ~ "
+                  f"{(hour_anchor + timedelta(hours=1)).strftime('%m-%d %H:%M')}")
     day_range = f"{(day_anchor - timedelta(days=6)).strftime(DAY_FMT)} ~ {day_anchor.strftime(DAY_FMT)}"
+
+    # "数据到底到哪儿了"和窗口末端是两码事：采集断了的时候数据明显更旧，
+    # 得单独说出来，否则页面上只有"数据截止"一个时间，看不出差了多远。
+    # 两个粒度都可能有数据（时报断了、日报还在采），取更新的那一格；滞后多久
+    # 从那一格的结束时刻算到现在，跟"数据截止"说的是同一份数据。
+    newest_hour = max(hourly) if hourly else None
+    newest_day = max(daily) if daily else None
+    day_start = datetime.combine(newest_day, datetime.min.time()) if newest_day else None
+    if newest_hour is not None and (day_start is None or newest_hour >= day_start):
+        data_through = newest_hour.strftime(HOUR_FMT)
+        covered_until = newest_hour + timedelta(hours=1)
+    elif day_start is not None:
+        data_through = newest_day.strftime(DAY_FMT)
+        covered_until = day_start + timedelta(days=1)
+    else:
+        data_through, covered_until = "-", None
+
+    lag_hours = int((now - covered_until).total_seconds() // 3600) if covered_until else 0
+    # 顶栏紧挨着「数据截止」，这里只说差了多少，不再重复那个时间
+    lag_note = f"数据比当前时间旧 {lag_hours} 小时" if lag_hours >= 1 else ""
 
     return {
         "hour_anchor": hour_anchor,
@@ -438,6 +480,10 @@ def collect_windows(hourly: dict, daily: dict) -> dict:
         "day_range": day_range,
         "hour": hour,
         "day": day,
+        "newest_hour": newest_hour,
+        "newest_day": newest_day,
+        "data_through": data_through,
+        "lag_note": lag_note,
     }
 
 
@@ -446,27 +492,44 @@ def _preview(labels: list[str], limit: int = 3) -> str:
     return head + " 等" if len(labels) > limit else head
 
 
-def _window_quality(window_info: dict, unit: str) -> str:
-    """数据完整性描述：缺多少个时段、多少个文件是空的。"""
+def _slot_phrase(count: int, unit: str) -> str:
+    """「3 个整点」/「1 天」—— 中文量词，别写成「1 个天」。"""
+    return f"{count} 天" if unit == "天" else f"{count} 个{unit}"
+
+
+def _window_quality(window_info: dict, unit: str, directory: str, newest: str) -> str:
+    """数据完整性描述：缺多少个时段、多少个文件是空的。
+
+    窗口按当前时间定，所以「一个文件都没有」得说清是哪种：目录里压根没文件，还是
+    文件都在窗口之外（采集停过一段，或者页面看的是历史导出数据）—— 页面上就一张
+    空图的话，这两种情况看起来一模一样。
+    """
+    try:                                     # 提示里写项目内的相对路径，好按图索骥
+        shown = os.path.relpath(directory, BASE_DIR)
+    except ValueError:                       # Windows 上跨盘符时 relpath 会抛
+        shown = directory
+    if shown.startswith(".."):               # 目录在项目外（DASHBOARD_DATA_DIR 指到别处）就写全路径
+        shown = directory
+
+    if not window_info["covered"]:
+        if not _excel_files(directory):
+            kind = "小时" if unit == "整点" else unit
+            return f"{shown} 下没有任何符合命名规范的{kind}文件"
+        where = f"（{shown} 里最新的到 {newest}）" if newest else ""
+        return f"这 {_slot_phrase(window_info['total_slots'], unit)}都没有数据文件{where}"
+
     problems = []
     missing = window_info.get("missing") or []
     empty = window_info.get("empty") or []
     if missing:
-        problems.append(f"缺 {len(missing)} 个{unit}的数据（{_preview(missing)}）")
+        problems.append(f"缺 {_slot_phrase(len(missing), unit)}的数据（{_preview(missing)}）")
     if empty:
         problems.append(f"{len(empty)} 个文件里没有明细记录（{_preview(empty)}）")
     return "；".join(problems)
 
 
-def _empty_dir_note(window_info: dict, directory: str, unit: str) -> str:
-    """整个窗口一个文件都没有时的提示（否则页面上只有一张空图，看不出是没数据还是画错了）。"""
-    if window_info["total_slots"]:
-        return ""
-    return f"data/{directory} 下没有任何符合命名规范的{unit}文件"
-
-
 def _chart_block(window: str, type_name: str, frame: pd.DataFrame, range_label: str,
-                 window_info: dict) -> dict:
+                 window_info: dict, quality: str) -> dict:
     """一张 TOP10 柱状图需要的一切：标题、口径说明、数据完整性、下载入口。"""
     sub = _slice_type(frame, type_name)
     total = int(sub["Count"].sum()) if not sub.empty else 0
@@ -474,17 +537,17 @@ def _chart_block(window: str, type_name: str, frame: pd.DataFrame, range_label: 
     window_label = "近 24 小时" if window == "24h" else "近 7 天"
     unit = "整点" if window == "24h" else "天"
     covered, total_slots = window_info["covered"], window_info["total_slots"]
-    if total_slots:
-        coverage = f"数据覆盖 {covered}/{total_slots} 个{unit}"
-    else:  # 整个窗口一个文件都没有，说"覆盖 0/0"没有意义
-        coverage = f"未找到{'小时' if window == '24h' else '天'}文件"
+    # 窗口按当前时间定，格子数恒定（24 / 7），一个文件都没有时是 0/24，原因写在
+    # data_note 里（目录空 / 文件都在窗口之外）—— 这里不再另说一套话
+    coverage = f"数据覆盖 {covered}/{_slot_phrase(total_slots, unit)}"
     return {
         "window": window,
         "type": type_name,
         "title": f"{window_label} TOP10 Tag · {type_label}",
         "note": (f"统计区间 {range_label} · {type_label}事件共 {total:,} 次 · "
-                 f"{coverage} · 占比为该类事件内占比"),
-        "data_note": _window_quality(window_info, unit),
+                 f"{coverage} · 占比为该类事件内占比"
+                 + (f" · {window_info['note']}" if window_info.get("note") else "")),
+        "data_note": quality,
         "total": total,
         "items": _top_tags(sub, total, type_name),
         "download_url": f"/api/download/window?range={window}&type={type_name}",
@@ -510,14 +573,20 @@ def build_dashboard() -> dict:
         }
 
     windows = collect_windows(hourly, daily)
-    hour_anchor = windows["hour_anchor"]
     hour, day = windows["hour"], windows["day"]
+    newest_hour, newest_day = windows["newest_hour"], windows["newest_day"]
+
+    # 完整性提示算一次，趋势图副标题、四张排行图的红字、顶部横幅共用同一份口径
+    hour_quality = _window_quality(hour, "整点", HOURLY_DIR,
+                                   newest_hour.strftime("%Y-%m-%d %H:00") if newest_hour else "")
+    day_quality = _window_quality(day, "天", DAILY_DIR,
+                                  newest_day.strftime(DAY_FMT) if newest_day else "")
 
     charts = [
-        _chart_block("24h", "Operation", windows["hour_frame"], windows["hour_range"], hour),
-        _chart_block("24h", "Alarm", windows["hour_frame"], windows["hour_range"], hour),
-        _chart_block("7d", "Operation", windows["week_frame"], windows["day_range"], day),
-        _chart_block("7d", "Alarm", windows["week_frame"], windows["day_range"], day),
+        _chart_block("24h", "Operation", windows["hour_frame"], windows["hour_range"], hour, hour_quality),
+        _chart_block("24h", "Alarm", windows["hour_frame"], windows["hour_range"], hour, hour_quality),
+        _chart_block("7d", "Operation", windows["week_frame"], windows["day_range"], day, day_quality),
+        _chart_block("7d", "Alarm", windows["week_frame"], windows["day_range"], day, day_quality),
     ]
 
     return {
@@ -525,14 +594,17 @@ def build_dashboard() -> dict:
         "meta": {
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "data_dir": DATA_DIR,  # 方便确认看板读的到底是哪个目录（也能让自测校验端口没串）
-            "data_through": hour_anchor.strftime(HOUR_FMT) if hour_anchor else "-",
+            # 数据里实际最新的一格，不是窗口末端 —— 两者不一样时 lag_note 会说明差多少
+            "data_through": windows["data_through"],
+            "lag_note": windows["lag_note"],
             "hour_window": {
                 "label": windows["hour_range"],
                 "points": len(hour["labels"]),
                 "covered": hour["covered"],
                 "missing": hour["missing"],
                 "empty": hour["empty"],
-                "quality": _window_quality(hour, "整点") or _empty_dir_note(hour, "hourly", "小时"),
+                "note": hour["note"],
+                "quality": hour_quality,
             },
             "day_window": {
                 "label": windows["day_range"],
@@ -540,7 +612,7 @@ def build_dashboard() -> dict:
                 "covered": day["covered"],
                 "missing": day["missing"],
                 "empty": day["empty"],
-                "quality": _window_quality(day, "天") or _empty_dir_note(day, "daily", "天"),
+                "quality": day_quality,
             },
             "files": {"hourly": len(_excel_files(HOURLY_DIR)), "daily": len(_excel_files(DAILY_DIR))},
             "warnings": warnings,
