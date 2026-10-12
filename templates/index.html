@@ -568,11 +568,13 @@
     var meta = res.meta;
 
     $('meta-line').innerHTML = '数据截止 <b>' + esc(meta.data_through) + '</b>'
+      + (meta.lag_note ? ' ｜ <b>' + esc(meta.lag_note) + '</b>' : '')
       + ' ｜ 小时文件 ' + meta.files.hourly + ' 个 · 天文件 ' + meta.files.daily + ' 个'
       + ' ｜ 页面生成 ' + esc(meta.generated_at);
 
     $('note-hour').textContent = meta.hour_window.label + ' · ' + meta.hour_window.points + ' 个整点'
-      + ' · 数据覆盖 ' + meta.hour_window.covered + '/' + meta.hour_window.points;
+      + ' · 数据覆盖 ' + meta.hour_window.covered + '/' + meta.hour_window.points
+      + (meta.hour_window.note ? ' · ' + meta.hour_window.note : '');
     $('note-day').textContent = meta.day_window.label + ' · ' + meta.day_window.days + ' 天'
       + ' · 数据覆盖 ' + meta.day_window.covered + '/' + meta.day_window.days;
     setQuality('quality-hour', meta.hour_window.quality);
